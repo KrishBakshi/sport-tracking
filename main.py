@@ -28,6 +28,7 @@ MIN_POSE_FILL = 0.15
 
 POSE_EVERY = 1
 DET_EVERY = 1
+TRACKER = "botsort.yaml"  # Ultralytics BoT-SORT
 
 # COCO-17 pose skeleton edges (keypoint index pairs)
 POSE_SKELETON = (
@@ -212,25 +213,37 @@ def detect_fighters(
     ov_model: YOLOWorld,
     frame,
     latencies_ms: list[float],
+    preferred_ids: list[int] | None = None,
     max_fighters: int = MAX_FIGHTERS,
-) -> list[tuple[int, int, int, int]]:
-    """Open-vocab person detect; return up to max_fighters boxes (no referee)."""
+) -> tuple[list[tuple[int, int, int, int]], list[int]]:
+    """Track people with BoT-SORT; return up to max_fighters boxes + track ids."""
     t0 = time.perf_counter()
-    results = ov_model.predict(frame, conf=DET_CONF_MIN, verbose=False)
+    results = ov_model.track(
+        frame,
+        conf=DET_CONF_MIN,
+        persist=True,
+        tracker=TRACKER,
+        verbose=False,
+    )
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
     latencies_ms.append(elapsed_ms)
 
     result = results[0]
     if result.boxes is None or len(result.boxes) == 0:
-        return []
+        return [], []
 
-    boxes, _ids = select_fighter_boxes(
+    track_ids = None
+    if result.boxes.id is not None:
+        track_ids = result.boxes.id.cpu().numpy().astype(int)
+
+    return select_fighter_boxes(
         result.boxes.xyxy.cpu().numpy(),
         result.boxes.conf.cpu().numpy(),
         frame.shape,
+        track_ids=track_ids,
+        preferred_ids=preferred_ids,
         max_fighters=max_fighters,
     )
-    return boxes
 
 
 def pose_on_crop(
@@ -440,6 +453,7 @@ def process_video(
     cap, writer = open_video(video_in)
     frame_i = 0
     det_bboxes: list[tuple[int, int, int, int]] = []
+    fighter_track_ids: list[int] = []
 
     pose_latencies_ms: list[float] = []
     det_latencies_ms: list[float] = []
@@ -451,11 +465,20 @@ def process_video(
                 break
 
             if frame_i % DET_EVERY == 0:
-                det_bboxes = detect_fighters(ov_model, frame, det_latencies_ms)
+                det_bboxes, fighter_track_ids = detect_fighters(
+                    ov_model,
+                    frame,
+                    det_latencies_ms,
+                    preferred_ids=fighter_track_ids or None,
+                )
 
             if frame_i % POSE_EVERY == 0:
                 annotated = estimate_pose(
-                    pose_model, frame, det_bboxes, pose_latencies_ms
+                    pose_model,
+                    frame,
+                    det_bboxes,
+                    pose_latencies_ms,
+                    track_ids=fighter_track_ids,
                 )
             else:
                 annotated = frame
@@ -482,6 +505,7 @@ def main() -> None:
     out_path, metrics = process_video(pose_model, ov_model)
 
     print(f"Wrote H.264 {out_path}")
+    print(f"Tracker    — BoT-SORT ({TRACKER})")
     print(
         f"YOLO pose   — calls={metrics['pose']['calls']}  "
         f"avg_latency={metrics['pose']['avg_latency_ms']:.2f} ms  "
