@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import base64
-import json
-import re
 import subprocess
 import time
 from pathlib import Path
@@ -10,28 +7,21 @@ from pathlib import Path
 import cv2
 import imageio_ffmpeg
 import numpy as np
-from ultralytics import LLM, YOLO
+from ultralytics import YOLO, YOLOWorld
 
 VIDEO_IN = Path("data/test-fight-1.mp4")
 VIDEO_OUT = Path("output/annotated.mp4")
 VIDEO_TMP = Path("output/annotated.tmp.mp4")
 
 POSE_WEIGHTS = "yolo26m-pose.pt"
-VLM_MODEL = "unsloth/Qwen3.5-0.8B-GGUF:UD-Q4_K_XL"
-VLM_BASE_URL = "http://127.0.0.1:9931/v1"
-VLM_API_KEY = "sk-local"
+OV_WEIGHTS = "yolov8m-worldv2.pt"
+OV_CLASSES = ["person", "fighter"]
+MAX_FIGHTERS = 2
+DET_CONF_MIN = 0.25
+KPT_CONF_MIN = 0.3
 
 POSE_EVERY = 1
-VLM_EVERY = 1
-
-USER_PROMPT = """
-Detect every MMA fighter in the image.
-For each fighter, return a JSON object with:
-  "bbox_2d": [x1, y1, x2, y2] (coordinates normalized to 0-1000),
-  "label": "fighter",
-  "sub_label": species or "" if unknown
-Return a JSON array only, with no other text.
-"""
+DET_EVERY = 1
 
 # COCO-17 pose skeleton edges (keypoint index pairs)
 POSE_SKELETON = (
@@ -52,47 +42,19 @@ POSE_SKELETON = (
     (12, 14),
     (14, 16),
 )
-KPT_CONF_MIN = 0.3
 
 
 def load_pose_model(weights: str = POSE_WEIGHTS) -> YOLO:
     return YOLO(weights)
 
 
-def load_vlm(
-    model: str = VLM_MODEL,
-    base_url: str = VLM_BASE_URL,
-    api_key: str = VLM_API_KEY,
-) -> LLM:
-    return LLM(
-        model,
-        api="chat.completions",
-        base_url=base_url,
-        api_key=api_key,
-    )
-
-
-def frame_to_data_url(frame) -> str:
-    ok, buf = cv2.imencode(".jpg", frame)
-    if not ok:
-        raise ValueError("Failed to encode frame as JPEG")
-    b64 = base64.b64encode(buf).decode("utf-8")
-    return f"data:image/jpeg;base64,{b64}"
-
-
-def build_openai_messages(frame) -> list[dict]:
-    return [
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": USER_PROMPT},
-                {
-                    "type": "image_url",
-                    "image_url": {"url": frame_to_data_url(frame)},
-                },
-            ],
-        },
-    ]
+def load_open_vocab_model(
+    weights: str = OV_WEIGHTS,
+    classes: list[str] | None = None,
+) -> YOLOWorld:
+    model = YOLOWorld(weights)
+    model.set_classes(classes or OV_CLASSES)
+    return model
 
 
 def average_metrics(latencies_ms: list[float]) -> dict:
@@ -119,60 +81,37 @@ def average_metrics(latencies_ms: list[float]) -> dict:
     }
 
 
-def parse_vlm_bboxes(content: str, frame_shape: tuple[int, ...]) -> list[tuple[int, int, int, int]]:
-    """Parse OpenAI/VLM JSON into pixel xyxy boxes (norm coords are 0-1000)."""
-    if not content:
-        return []
-
-    text = content.strip()
-    fenced = re.search(r"```(?:json)?\s*(.*?)```", text, flags=re.DOTALL | re.IGNORECASE)
-    if fenced:
-        text = fenced.group(1).strip()
-
-    try:
-        start = text.index("[")
-        end = text.rindex("]") + 1
-        payload = json.loads(text[start:end])
-    except (ValueError, json.JSONDecodeError):
-        return []
-
-    if not isinstance(payload, list):
-        return []
-
-    h, w = frame_shape[:2]
-    boxes: list[tuple[int, int, int, int]] = []
-    for item in payload:
-        if not isinstance(item, dict):
-            continue
-        bbox = item.get("bbox_2d") or item.get("bbox") or item.get("box")
-        if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
-            continue
-        x1, y1, x2, y2 = (float(v) for v in bbox)
-        px1 = int(np.clip(x1 / 1000.0 * w, 0, w - 1))
-        py1 = int(np.clip(y1 / 1000.0 * h, 0, h - 1))
-        px2 = int(np.clip(x2 / 1000.0 * w, 0, w - 1))
-        py2 = int(np.clip(y2 / 1000.0 * h, 0, h - 1))
-        if px2 <= px1 or py2 <= py1:
-            continue
-        boxes.append((px1, py1, px2, py2))
-
-    return boxes[:2]
-
-
-def analyze_frame_with_qwen(
-    vlm: LLM,
+def detect_fighters(
+    ov_model: YOLOWorld,
     frame,
     latencies_ms: list[float],
+    max_fighters: int = MAX_FIGHTERS,
 ) -> list[tuple[int, int, int, int]]:
-    messages = build_openai_messages(frame)
-
+    """Open-vocab detect; return up to max_fighters boxes by confidence."""
     t0 = time.perf_counter()
-    resp = vlm(source=messages)
+    results = ov_model.predict(frame, conf=DET_CONF_MIN, verbose=False)
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
     latencies_ms.append(elapsed_ms)
 
-    content = resp.choices[0].message.content or ""
-    return parse_vlm_bboxes(content, frame.shape)
+    result = results[0]
+    if result.boxes is None or len(result.boxes) == 0:
+        return []
+
+    xyxy = result.boxes.xyxy.cpu().numpy()
+    conf = result.boxes.conf.cpu().numpy()
+    order = np.argsort(-conf)[:max_fighters]
+
+    h, w = frame.shape[:2]
+    boxes: list[tuple[int, int, int, int]] = []
+    for i in order:
+        x1, y1, x2, y2 = xyxy[i]
+        px1 = int(np.clip(x1, 0, w - 1))
+        py1 = int(np.clip(y1, 0, h - 1))
+        px2 = int(np.clip(x2, 0, w - 1))
+        py2 = int(np.clip(y2, 0, h - 1))
+        if px2 > px1 and py2 > py1:
+            boxes.append((px1, py1, px2, py2))
+    return boxes
 
 
 def pose_on_crop(
@@ -218,9 +157,9 @@ def draw_keypoints(
         cv2.line(frame, pa, pb, color, 2)
 
 
-def draw_vlm_boxes(frame, vlm_bboxes: list[tuple[int, int, int, int]]):
+def draw_det_boxes(frame, bboxes: list[tuple[int, int, int, int]]):
     out = frame.copy()
-    for i, (x1, y1, x2, y2) in enumerate(vlm_bboxes):
+    for i, (x1, y1, x2, y2) in enumerate(bboxes):
         color = (0, 255, 0) if i == 0 else (0, 165, 255)
         cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
         cv2.putText(
@@ -238,18 +177,18 @@ def draw_vlm_boxes(frame, vlm_bboxes: list[tuple[int, int, int, int]]):
 def estimate_pose(
     pose_model: YOLO,
     frame,
-    vlm_bboxes: list[tuple[int, int, int, int]],
+    det_bboxes: list[tuple[int, int, int, int]],
     latencies_ms: list[float],
 ):
-    """Crop each VLM bbox -> YOLO pose -> keep highest-conf person; draw keypoints only."""
-    if not vlm_bboxes:
+    """Crop each det bbox -> YOLO pose -> keep highest-conf person; draw keypoints only."""
+    if not det_bboxes:
         return frame
 
-    out = draw_vlm_boxes(frame, vlm_bboxes)
+    out = draw_det_boxes(frame, det_bboxes)
     colors = ((0, 255, 0), (0, 165, 255))
 
     t0 = time.perf_counter()
-    for i, (x1, y1, x2, y2) in enumerate(vlm_bboxes):
+    for i, (x1, y1, x2, y2) in enumerate(det_bboxes):
         crop = frame[y1:y2, x1:x2]
         if crop.size == 0:
             continue
@@ -315,13 +254,17 @@ def reencode_h264(src: Path, dst: Path = VIDEO_OUT) -> Path:
     return dst
 
 
-def process_video(pose_model: YOLO, vlm: LLM, video_in: Path = VIDEO_IN) -> tuple[Path, dict]:
+def process_video(
+    pose_model: YOLO,
+    ov_model: YOLOWorld,
+    video_in: Path = VIDEO_IN,
+) -> tuple[Path, dict]:
     cap, writer = open_video(video_in)
     frame_i = 0
-    vlm_bboxes: list[tuple[int, int, int, int]] = []
+    det_bboxes: list[tuple[int, int, int, int]] = []
 
     pose_latencies_ms: list[float] = []
-    vlm_latencies_ms: list[float] = []
+    det_latencies_ms: list[float] = []
 
     try:
         while True:
@@ -329,12 +272,12 @@ def process_video(pose_model: YOLO, vlm: LLM, video_in: Path = VIDEO_IN) -> tupl
             if not ok:
                 break
 
-            if frame_i % VLM_EVERY == 0:
-                vlm_bboxes = analyze_frame_with_qwen(vlm, frame, vlm_latencies_ms)
+            if frame_i % DET_EVERY == 0:
+                det_bboxes = detect_fighters(ov_model, frame, det_latencies_ms)
 
             if frame_i % POSE_EVERY == 0:
                 annotated = estimate_pose(
-                    pose_model, frame, vlm_bboxes, pose_latencies_ms
+                    pose_model, frame, det_bboxes, pose_latencies_ms
                 )
             else:
                 annotated = frame
@@ -349,7 +292,7 @@ def process_video(pose_model: YOLO, vlm: LLM, video_in: Path = VIDEO_IN) -> tupl
 
     metrics = {
         "pose": average_metrics(pose_latencies_ms),
-        "vlm": average_metrics(vlm_latencies_ms),
+        "open_vocab": average_metrics(det_latencies_ms),
         "frames": frame_i,
     }
     return out_path, metrics
@@ -357,19 +300,19 @@ def process_video(pose_model: YOLO, vlm: LLM, video_in: Path = VIDEO_IN) -> tupl
 
 def main() -> None:
     pose_model = load_pose_model()
-    vlm = load_vlm()
-    out_path, metrics = process_video(pose_model, vlm)
+    ov_model = load_open_vocab_model()
+    out_path, metrics = process_video(pose_model, ov_model)
 
     print(f"Wrote H.264 {out_path}")
     print(
-        f"YOLO pose  — calls={metrics['pose']['calls']}  "
+        f"YOLO pose   — calls={metrics['pose']['calls']}  "
         f"avg_latency={metrics['pose']['avg_latency_ms']:.2f} ms  "
         f"avg_throughput={metrics['pose']['avg_throughput_fps']:.2f} FPS"
     )
     print(
-        f"VLM Qwen   — calls={metrics['vlm']['calls']}  "
-        f"avg_latency={metrics['vlm']['avg_latency_ms']:.2f} ms  "
-        f"avg_throughput={metrics['vlm']['avg_throughput_fps']:.2f} FPS"
+        f"YOLO-World  — calls={metrics['open_vocab']['calls']}  "
+        f"avg_latency={metrics['open_vocab']['avg_latency_ms']:.2f} ms  "
+        f"avg_throughput={metrics['open_vocab']['avg_throughput_fps']:.2f} FPS"
     )
 
 
