@@ -1,12 +1,11 @@
 [project]
 name = "sport-tracking"
 version = "0.1.0"
-description = "Qwen VLM fighter boxes + YOLO pose keypoints for sport clips"
+description = "Open-vocab YOLO fighter detection + pose keypoints for sport clips"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "imageio-ffmpeg>=0.7.0",
     "lap>=0.5.12",
-    "openai>=2.0.0",
     "ultralytics>=8.4.191",
 ]
